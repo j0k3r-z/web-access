@@ -176,6 +176,10 @@ async function connect() {
       cleanup();
       connectingPromise = null;
       console.log(`[CDP Proxy] 已连接 Chrome (端口 ${chromePort})`);
+      // Legacy 连接成功后，同步端口给已连接的 Extension
+      if (useExtension() && chromePort) {
+        try { extensionWs.send(JSON.stringify({ type: 'config', chromePort })); } catch {}
+      }
       resolve();
     };
     const onError = (e) => {
@@ -615,6 +619,10 @@ if (extensionWss) {
     extensionWss.handleUpgrade(req, socket, head, (ws) => {
       extensionWs = ws;
       console.log('[CDP Proxy] Extension connected');
+      // 同步 chromePort 给 Extension，用于精确端口拦截
+      if (chromePort) {
+        ws.send(JSON.stringify({ type: 'config', chromePort }));
+      }
       ws.on('message', (data) => {
         let msg;
         try { msg = JSON.parse(data.toString()); } catch { return; }

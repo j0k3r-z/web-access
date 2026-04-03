@@ -38,6 +38,20 @@ function connect() {
       return;
     }
     if (msg.type === 'pong') return;
+    // 接收 Proxy 推送的 chromePort（用于精确端口拦截）
+    if (msg.type === 'config') {
+      if (msg.chromePort && msg.chromePort !== chromeDebugPort) {
+        chromeDebugPort = msg.chromePort;
+        console.log(`[CDP Bridge] Received chromePort from proxy: ${chromeDebugPort}`);
+        // 对已 attach 但未 guard 的 tab 补充启用拦截
+        for (const tabId of attachedTabs) {
+          if (!portGuardedTabs.has(tabId)) {
+            enablePortGuard(tabId);
+          }
+        }
+      }
+      return;
+    }
 
     try {
       const result = await handleCommand(msg);
@@ -119,10 +133,12 @@ async function cdp(tabId, method, params = {}) {
 // --- 调试端口探测拦截（反风控） ---
 // 拦截页面 JS 对 Chrome 调试端口的 HTTP 探测请求
 // 网站通过请求 127.0.0.1:{debugPort}/json 来检测用户是否在调试模式
+// 端口来源优先级：1. Proxy 推送的精确端口  2. fetch() 探测常见端口（兜底）
 
 async function detectChromeDebugPort() {
+  // 已有端口（Proxy 推送或之前探测到的）
   if (chromeDebugPort) return chromeDebugPort;
-  // 尝试常见调试端口
+  // 兜底：探测常见端口
   for (const port of [9222, 9229, 9333]) {
     try {
       const resp = await fetch(`http://127.0.0.1:${port}/json/version`, {
@@ -130,7 +146,7 @@ async function detectChromeDebugPort() {
       });
       if (resp.ok) {
         chromeDebugPort = port;
-        console.log(`[CDP Bridge] Detected Chrome debug port: ${port}`);
+        console.log(`[CDP Bridge] Detected Chrome debug port via probe: ${port}`);
         return port;
       }
     } catch { /* not this port */ }
