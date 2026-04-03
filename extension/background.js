@@ -10,6 +10,8 @@ let heartbeatTimer = null;
 const targetToTab = new Map();
 const tabToTarget = new Map();
 const attachedTabs = new Set();
+const portGuardedTabs = new Set();
+let chromeDebugPort = null;
 
 // --- WebSocket Client ---
 
@@ -105,11 +107,51 @@ async function ensureAttached(tabId) {
   if (attachedTabs.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, '1.3');
   attachedTabs.add(tabId);
+  // 启用调试端口探测拦截（反风控）
+  await enablePortGuard(tabId);
 }
 
 async function cdp(tabId, method, params = {}) {
   await ensureAttached(tabId);
   return await chrome.debugger.sendCommand({ tabId }, method, params);
+}
+
+// --- 调试端口探测拦截（反风控） ---
+// 拦截页面 JS 对 Chrome 调试端口的 HTTP 探测请求
+// 网站通过请求 127.0.0.1:{debugPort}/json 来检测用户是否在调试模式
+
+async function detectChromeDebugPort() {
+  if (chromeDebugPort) return chromeDebugPort;
+  // 尝试常见调试端口
+  for (const port of [9222, 9229, 9333]) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(1000),
+      });
+      if (resp.ok) {
+        chromeDebugPort = port;
+        console.log(`[CDP Bridge] Detected Chrome debug port: ${port}`);
+        return port;
+      }
+    } catch { /* not this port */ }
+  }
+  return null;
+}
+
+async function enablePortGuard(tabId) {
+  if (portGuardedTabs.has(tabId)) return;
+  const port = await detectChromeDebugPort();
+  if (!port) return;
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Fetch.enable', {
+      patterns: [
+        { urlPattern: `http://127.0.0.1:${port}/*`, requestStage: 'Request' },
+        { urlPattern: `http://localhost:${port}/*`, requestStage: 'Request' },
+      ]
+    });
+    portGuardedTabs.add(tabId);
+    console.log(`[CDP Bridge] Port guard enabled for tab ${tabId} (port ${port})`);
+  } catch { /* Fetch domain not available, non-fatal */ }
 }
 
 // --- Helpers ---
@@ -253,13 +295,26 @@ async function handleSetFiles(msg) {
 
 // --- Event Listeners ---
 
+// 拦截调试端口探测请求（Fetch.requestPaused 事件）
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === 'Fetch.requestPaused' && source.tabId) {
+    chrome.debugger.sendCommand(
+      { tabId: source.tabId },
+      'Fetch.failRequest',
+      { requestId: params.requestId, errorReason: 'ConnectionRefused' }
+    ).catch(() => {});
+  }
+});
+
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
+  portGuardedTabs.delete(source.tabId);
   console.log(`[CDP Bridge] Detached from tab ${source.tabId}: ${reason}`);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
+  portGuardedTabs.delete(tabId);
   const targetId = tabToTarget.get(tabId);
   if (targetId) {
     targetToTab.delete(targetId);
