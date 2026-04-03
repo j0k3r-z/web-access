@@ -105,9 +105,17 @@ function startProxyDetached() {
 }
 
 async function ensureProxy() {
+  const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
   const targetsUrl = `http://127.0.0.1:${PROXY_PORT}/targets`;
 
-  // /targets 返回 JSON 数组即 ready
+  // 先检查 /health，识别连接模式
+  const health = await httpGetJson(healthUrl);
+  if (health?.connected) {
+    console.log(`proxy: ready (${health.mode || 'legacy'} mode)`);
+    return true;
+  }
+
+  // /targets 返回 JSON 数组也算 ready
   const targets = await httpGetJson(targetsUrl);
   if (Array.isArray(targets)) {
     console.log('proxy: ready');
@@ -122,19 +130,25 @@ async function ensureProxy() {
   await new Promise((r) => setTimeout(r, 2000));
 
   for (let i = 1; i <= 15; i++) {
+    // 优先检查 health（Extension 模式下 /targets 需要 Extension 连接）
+    const h = await httpGetJson(healthUrl, 8000);
+    if (h?.connected) {
+      console.log(`proxy: ready (${h.mode || 'legacy'} mode)`);
+      return true;
+    }
     const result = await httpGetJson(targetsUrl, 8000);
     if (Array.isArray(result)) {
       console.log('proxy: ready');
       return true;
     }
     if (i === 1) {
-      console.log('⚠️  Chrome 可能有授权弹窗，请点击「允许」后等待连接...');
+      console.log('waiting for connection (Extension auto-connect or chrome://inspect authorization)...');
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  console.log('❌ 连接超时，请检查 Chrome 调试设置');
-  console.log(`  日志：${path.join(os.tmpdir(), 'cdp-proxy.log')}`);
+  console.log('connection timeout, check Chrome debug settings or install CDP Bridge extension');
+  console.log(`  log: ${path.join(os.tmpdir(), 'cdp-proxy.log')}`);
   return false;
 }
 

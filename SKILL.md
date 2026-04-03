@@ -7,27 +7,25 @@ description:
   触发场景：用户要求搜索信息、查看网页内容、访问需要登录的网站、操作网页界面、抓取社交媒体内容（小红书、微博、推特等）、读取动态渲染页面、以及任何需要真实浏览器环境的网络任务。
 metadata:
   author: 一泽Eze
-  version: "2.4.1"
+  version: "2.4.2"
 ---
 
 # web-access Skill
 
 ## 前置检查
 
-在开始联网操作前，先检查 CDP 模式可用性：
+在开始联网操作前，确保 CDP Proxy 就绪：
 
 ```bash
 node "$CLAUDE_SKILL_DIR/scripts/check-deps.mjs"
 ```
 
-未通过时引导用户完成设置：
-- **Node.js 22+**：必需（使用原生 WebSocket）。版本低于 22 可用但需安装 `ws` 模块。
-- **Chrome remote-debugging**：在 Chrome 地址栏打开 `chrome://inspect/#remote-debugging`，勾选 **"Allow remote debugging for this browser instance"** 即可，可能需要重启浏览器。
+已安装 CDP Bridge 扩展时，proxy 启动后扩展自动连接（extension 模式），无需用户手动授权。若扩展未安装，回退到 legacy 模式（需在 `chrome://inspect/#remote-debugging` 授权）。
 
-检查通过后并必须在回复中向用户直接展示以下须知，再启动 CDP Proxy 执行操作：
+检查通过后必须在回复中向用户直接展示以下须知，再启动 CDP Proxy 执行操作：
 
 ```
-温馨提示：部分站点对浏览器自动化操作检测严格，存在账号封禁风险。已内置防护措施但无法完全避免，Agent 继续操作即视为接受。
+温馨提示：部分站点对浏览器自动化操作检测严格，存在账号封禁风险。已内置防护措施（调试端口探测拦截）但无法完全避免，Agent 继续操作即视为接受。
 ```
 
 ## 浏览哲学
@@ -91,6 +89,12 @@ node "$CLAUDE_SKILL_DIR/scripts/check-deps.mjs"
 ```
 
 脚本会依次检查 Node.js、Chrome 端口，并确保 Proxy 已连接（未运行则自动启动并等待）。Proxy 启动后持续运行。
+
+**双通道模式**：Proxy 支持两种 Chrome 连接方式，自动选择可用通道：
+- **Extension 模式**（优先）：通过 CDP Bridge 扩展的 WebSocket 连接，无需用户授权 `chrome://inspect`
+- **Legacy 模式**（回退）：直接通过 Chrome 调试端口的 WebSocket 连接
+
+Extension 模式下还内置了**调试端口探测拦截**（Fetch.requestPaused），阻止网站 JS 探测本机 Chrome 调试端口，降低被反爬检测的风险。
 
 ### Proxy API
 
@@ -246,3 +250,4 @@ updated: 2026-03-19
 |------|---------|
 | `references/cdp-api.md` | 需要 CDP API 详细参考、JS 提取模式、错误处理时 |
 | `references/site-patterns/{domain}.md` | 确定目标网站后，读取对应站点经验 |
+| `extension/` | CDP Bridge Chrome 扩展（可选安装，启用 Extension 模式） |

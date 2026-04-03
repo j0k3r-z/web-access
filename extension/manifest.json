@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "CDP Bridge",
+  "version": "1.0.0",
+  "description": "Bridge between cdp-proxy and chrome.debugger API",
+  "permissions": ["debugger", "tabs", "webNavigation"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "minimum_chrome_version": "118"
+}
