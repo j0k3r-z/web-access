@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-// 环境检查 + 确保 CDP Proxy 就绪（跨平台，替代 check-deps.sh）
+// 环境检查 + 确保 CDP Proxy 就绪（Extension-only mode）
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,65 +23,7 @@ function checkNode() {
   }
 }
 
-// --- TCP 端口探测 ---
-
-function checkPort(port, host = '127.0.0.1', timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection(port, host);
-    const timer = setTimeout(() => { socket.destroy(); resolve(false); }, timeoutMs);
-    socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
-    socket.once('error', () => { clearTimeout(timer); resolve(false); });
-  });
-}
-
-// --- Chrome 调试端口检测（DevToolsActivePort 多路径 + 常见端口回退） ---
-
-function activePortFiles() {
-  const home = os.homedir();
-  const localAppData = process.env.LOCALAPPDATA || '';
-  switch (os.platform()) {
-    case 'darwin':
-      return [
-        path.join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-        path.join(home, 'Library/Application Support/Google/Chrome Canary/DevToolsActivePort'),
-        path.join(home, 'Library/Application Support/Chromium/DevToolsActivePort'),
-      ];
-    case 'linux':
-      return [
-        path.join(home, '.config/google-chrome/DevToolsActivePort'),
-        path.join(home, '.config/chromium/DevToolsActivePort'),
-      ];
-    case 'win32':
-      return [
-        path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort'),
-        path.join(localAppData, 'Chromium/User Data/DevToolsActivePort'),
-      ];
-    default:
-      return [];
-  }
-}
-
-async function detectChromePort() {
-  // 优先从 DevToolsActivePort 文件读取
-  for (const filePath of activePortFiles()) {
-    try {
-      const lines = fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/).filter(Boolean);
-      const port = parseInt(lines[0], 10);
-      if (port > 0 && port < 65536 && await checkPort(port)) {
-        return port;
-      }
-    } catch (_) {}
-  }
-  // 回退：探测常见端口
-  for (const port of [9222, 9229, 9333]) {
-    if (await checkPort(port)) {
-      return port;
-    }
-  }
-  return null;
-}
-
-// --- CDP Proxy 启动与等待 ---
+// --- HTTP JSON 请求 ---
 
 function httpGetJson(url, timeoutMs = 3000) {
   return fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
@@ -91,6 +32,8 @@ function httpGetJson(url, timeoutMs = 3000) {
     })
     .catch(() => null);
 }
+
+// --- CDP Proxy 启动与等待 ---
 
 function startProxyDetached() {
   const logFile = path.join(os.tmpdir(), 'cdp-proxy.log');
@@ -106,48 +49,37 @@ function startProxyDetached() {
 
 async function ensureProxy() {
   const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
-  const targetsUrl = `http://127.0.0.1:${PROXY_PORT}/targets`;
 
-  // 先检查 /health，识别连接模式
+  // 检查已有实例
   const health = await httpGetJson(healthUrl);
   if (health?.connected) {
-    console.log(`proxy: ready (${health.mode || 'legacy'} mode)`);
+    console.log('proxy: ready (extension mode)');
     return true;
   }
 
-  // /targets 返回 JSON 数组也算 ready
-  const targets = await httpGetJson(targetsUrl);
-  if (Array.isArray(targets)) {
-    console.log('proxy: ready');
-    return true;
+  // 未运行则启动
+  if (!health) {
+    console.log('proxy: starting...');
+    startProxyDetached();
+    await new Promise((r) => setTimeout(r, 2000));
+  } else {
+    console.log('proxy: waiting for Extension...');
   }
 
-  // 未运行或未连接，启动并等待
-  console.log('proxy: connecting...');
-  startProxyDetached();
-
-  // 等 proxy 进程就绪
-  await new Promise((r) => setTimeout(r, 2000));
-
+  // 等待 Extension 连接
   for (let i = 1; i <= 15; i++) {
-    // 优先检查 health（Extension 模式下 /targets 需要 Extension 连接）
     const h = await httpGetJson(healthUrl, 8000);
     if (h?.connected) {
-      console.log(`proxy: ready (${h.mode || 'legacy'} mode)`);
-      return true;
-    }
-    const result = await httpGetJson(targetsUrl, 8000);
-    if (Array.isArray(result)) {
-      console.log('proxy: ready');
+      console.log('proxy: ready (extension mode)');
       return true;
     }
     if (i === 1) {
-      console.log('waiting for connection (Extension auto-connect or chrome://inspect authorization)...');
+      console.log('waiting for CDP Bridge Extension to connect...');
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  console.log('connection timeout, check Chrome debug settings or install CDP Bridge extension');
+  console.log('connection timeout. Please ensure CDP Bridge Extension is installed and enabled in Chrome.');
   console.log(`  log: ${path.join(os.tmpdir(), 'cdp-proxy.log')}`);
   return false;
 }
@@ -157,18 +89,21 @@ async function ensureProxy() {
 async function main() {
   checkNode();
 
-  const chromePort = await detectChromePort();
-  if (!chromePort) {
-    console.log('chrome: not connected — 请确保 Chrome 已打开，然后访问 chrome://inspect/#remote-debugging 并勾选 Allow remote debugging');
-    process.exit(1);
-  }
-  console.log(`chrome: ok (port ${chromePort})`);
-
   const proxyOk = await ensureProxy();
   if (!proxyOk) {
     process.exit(1);
   }
 
+  // 列出已有站点经验
+  const patternsDir = path.join(ROOT, 'references', 'site-patterns');
+  try {
+    const sites = fs.readdirSync(patternsDir)
+      .filter(f => f.endsWith('.md'))
+      .map(f => f.replace(/\.md$/, ''));
+    if (sites.length) {
+      console.log(`\nsite-patterns: ${sites.join(', ')}`);
+    }
+  } catch {}
 }
 
 await main();

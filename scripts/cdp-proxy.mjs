@@ -1,20 +1,14 @@
 #!/usr/bin/env node
-// CDP Proxy - 通过 HTTP API 操控用户日常 Chrome
-// 双通道：Extension 模式（优先）/ Legacy CDP 模式（回退）
-// Node.js 22+（使用原生 WebSocket）
+// CDP Proxy - Extension-only mode
+// 通过 CDP Bridge Extension 的 WebSocket 连接操控用户日常 Chrome
+// Node.js 22+（ws 模块用于 WebSocket Server）
 
 import http from 'node:http';
 import { URL } from 'node:url';
 import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import net from 'node:net';
 
 const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
-let ws = null;
-let cmdId = 0;
-const pending = new Map(); // id -> {resolve, timer}
-const sessions = new Map(); // targetId -> sessionId
 
 // --- Extension WebSocket ---
 let extensionWs = null;
@@ -22,29 +16,12 @@ const extensionPending = new Map();
 let extensionCmdId = 0;
 let extensionWss = null;
 
-// --- WebSocket 兼容层 ---
-let WS;
-if (typeof globalThis.WebSocket !== 'undefined') {
-  // Node 22+ 原生 WebSocket（浏览器兼容 API）
-  WS = globalThis.WebSocket;
-} else {
-  // 回退到 ws 模块
-  try {
-    WS = (await import('ws')).default;
-  } catch {
-    console.error('[CDP Proxy] 错误：Node.js 版本 < 22 且未安装 ws 模块');
-    console.error('  解决方案：升级到 Node.js 22+ 或执行 npm install -g ws');
-    process.exit(1);
-  }
-}
-
-// 初始化 Extension WebSocket Server（优先用 ws 模块，否则用简单 HTTP upgrade）
 try {
   const { WebSocketServer } = await import('ws');
   extensionWss = new WebSocketServer({ noServer: true });
 } catch {
-  // ws 模块不可用时，Extension 模式不可用，仅使用 Legacy 模式
-  extensionWss = null;
+  console.error('[CDP Proxy] ws 模块未安装。执行: cd scripts && npm install ws');
+  process.exit(1);
 }
 
 function useExtension() {
@@ -64,260 +41,6 @@ function sendViaExtension(action, payload = {}) {
   });
 }
 
-async function execCDP(targetId, method, params = {}) {
-  if (useExtension()) {
-    return await sendViaExtension('cdp', { targetId, method, params });
-  }
-  const sid = await ensureSession(targetId);
-  return await sendCDP(method, params, sid);
-}
-
-// --- 自动发现 Chrome 调试端口 ---
-async function discoverChromePort() {
-  // 1. 尝试读 DevToolsActivePort 文件
-  const possiblePaths = [];
-  const platform = os.platform();
-
-  if (platform === 'darwin') {
-    const home = os.homedir();
-    possiblePaths.push(
-      path.join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-      path.join(home, 'Library/Application Support/Google/Chrome Canary/DevToolsActivePort'),
-      path.join(home, 'Library/Application Support/Chromium/DevToolsActivePort'),
-    );
-  } else if (platform === 'linux') {
-    const home = os.homedir();
-    possiblePaths.push(
-      path.join(home, '.config/google-chrome/DevToolsActivePort'),
-      path.join(home, '.config/chromium/DevToolsActivePort'),
-    );
-  } else if (platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || '';
-    possiblePaths.push(
-      path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort'),
-      path.join(localAppData, 'Chromium/User Data/DevToolsActivePort'),
-    );
-  }
-
-  for (const p of possiblePaths) {
-    try {
-      const content = fs.readFileSync(p, 'utf-8').trim();
-      const lines = content.split('\n');
-      const port = parseInt(lines[0]);
-      if (port > 0 && port < 65536) {
-        const ok = await checkPort(port);
-        if (ok) {
-          const wsPath = lines[1] || null;
-          console.log(`[CDP Proxy] 从 DevToolsActivePort 发现端口: ${port}${wsPath ? ' (带 wsPath)' : ''}`);
-          return { port, wsPath };
-        }
-      }
-    } catch { /* 文件不存在，继续 */ }
-  }
-
-  // 2. 扫描常用端口
-  const commonPorts = [9222, 9229, 9333];
-  for (const port of commonPorts) {
-    const ok = await checkPort(port);
-    if (ok) {
-      console.log(`[CDP Proxy] 扫描发现 Chrome 调试端口: ${port}`);
-      return { port, wsPath: null };
-    }
-  }
-
-  return null;
-}
-
-// 用 TCP 探测端口是否监听
-function checkPort(port) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection(port, '127.0.0.1');
-    const timer = setTimeout(() => { socket.destroy(); resolve(false); }, 2000);
-    socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
-    socket.once('error', () => { clearTimeout(timer); resolve(false); });
-  });
-}
-
-function getWebSocketUrl(port, wsPath) {
-  if (wsPath) return `ws://127.0.0.1:${port}${wsPath}`;
-  return `ws://127.0.0.1:${port}/devtools/browser`;
-}
-
-// --- WebSocket 连接管理 ---
-let chromePort = null;
-let chromeWsPath = null;
-
-let connectingPromise = null;
-async function connect() {
-  if (ws && (ws.readyState === WS.OPEN || ws.readyState === 1)) return;
-  if (connectingPromise) return connectingPromise;  // 复用进行中的连接
-
-  if (!chromePort) {
-    const discovered = await discoverChromePort();
-    if (!discovered) {
-      throw new Error(
-        'Chrome 未开启远程调试端口。请用以下方式启动 Chrome：\n' +
-        '  macOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n' +
-        '  Linux: google-chrome --remote-debugging-port=9222\n' +
-        '  或在 chrome://flags 中搜索 "remote debugging" 并启用'
-      );
-    }
-    chromePort = discovered.port;
-    chromeWsPath = discovered.wsPath;
-  }
-
-  const wsUrl = getWebSocketUrl(chromePort, chromeWsPath);
-  if (!wsUrl) throw new Error('无法获取 Chrome WebSocket URL');
-
-  return connectingPromise = new Promise((resolve, reject) => {
-    ws = new WS(wsUrl);
-
-    const onOpen = () => {
-      cleanup();
-      connectingPromise = null;
-      console.log(`[CDP Proxy] 已连接 Chrome (端口 ${chromePort})`);
-      // Legacy 连接成功后，同步端口给已连接的 Extension
-      if (useExtension() && chromePort) {
-        try { extensionWs.send(JSON.stringify({ type: 'config', chromePort })); } catch {}
-      }
-      resolve();
-    };
-    const onError = (e) => {
-      cleanup();
-      connectingPromise = null;
-      ws = null;
-      chromePort = null;
-      chromeWsPath = null;
-      const msg = e.message || e.error?.message || '连接失败';
-      console.error('[CDP Proxy] 连接错误:', msg, '（端口缓存已清除，下次将重新发现）');
-      reject(new Error(msg));
-    };
-    const onClose = () => {
-      console.log('[CDP Proxy] 连接断开');
-      ws = null;
-      chromePort = null;
-      chromeWsPath = null;
-      sessions.clear();
-    };
-    const onMessage = (evt) => {
-      const data = typeof evt === 'string' ? evt : (evt.data || evt);
-      const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
-
-      if (msg.method === 'Target.attachedToTarget') {
-        const { sessionId, targetInfo } = msg.params;
-        sessions.set(targetInfo.targetId, sessionId);
-      }
-      // 拦截页面对 Chrome 调试端口的探测请求（反风控）
-      if (msg.method === 'Fetch.requestPaused') {
-        const { requestId, sessionId: sid } = msg.params;
-        sendCDP('Fetch.failRequest', { requestId, errorReason: 'ConnectionRefused' }, sid).catch(() => {});
-      }
-      if (msg.id && pending.has(msg.id)) {
-        const { resolve, timer } = pending.get(msg.id);
-        clearTimeout(timer);
-        pending.delete(msg.id);
-        resolve(msg);
-      }
-    };
-
-    function cleanup() {
-      ws.removeEventListener?.('open', onOpen);
-      ws.removeEventListener?.('error', onError);
-    }
-
-    // 兼容 Node 原生 WebSocket 和 ws 模块的事件 API
-    if (ws.on) {
-      ws.on('open', onOpen);
-      ws.on('error', onError);
-      ws.on('close', onClose);
-      ws.on('message', onMessage);
-    } else {
-      ws.addEventListener('open', onOpen);
-      ws.addEventListener('error', onError);
-      ws.addEventListener('close', onClose);
-      ws.addEventListener('message', onMessage);
-    }
-  });
-}
-
-function sendCDP(method, params = {}, sessionId = null) {
-  return new Promise((resolve, reject) => {
-    if (!ws || (ws.readyState !== WS.OPEN && ws.readyState !== 1)) {
-      return reject(new Error('WebSocket 未连接'));
-    }
-    const id = ++cmdId;
-    const msg = { id, method, params };
-    if (sessionId) msg.sessionId = sessionId;
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error('CDP 命令超时: ' + method));
-    }, 30000);
-    pending.set(id, { resolve, timer });
-    ws.send(JSON.stringify(msg));
-  });
-}
-
-// 已启用端口拦截的 session 集合（避免重复启用）
-const portGuardedSessions = new Set();
-
-async function ensureSession(targetId) {
-  if (sessions.has(targetId)) return sessions.get(targetId);
-  const resp = await sendCDP('Target.attachToTarget', { targetId, flatten: true });
-  if (resp.result?.sessionId) {
-    const sid = resp.result.sessionId;
-    sessions.set(targetId, sid);
-    // 启用调试端口探测拦截
-    await enablePortGuard(sid);
-    return sid;
-  }
-  throw new Error('attach 失败: ' + JSON.stringify(resp.error));
-}
-
-// 拦截页面对 Chrome 调试端口的探测（反风控）
-// 只拦截 127.0.0.1:{chromePort} 的请求，不影响其他任何本地服务
-async function enablePortGuard(sessionId) {
-  if (!chromePort || portGuardedSessions.has(sessionId)) return;
-  try {
-    await sendCDP('Fetch.enable', {
-      patterns: [
-        { urlPattern: `http://127.0.0.1:${chromePort}/*`, requestStage: 'Request' },
-        { urlPattern: `http://localhost:${chromePort}/*`, requestStage: 'Request' },
-      ]
-    }, sessionId);
-    portGuardedSessions.add(sessionId);
-  } catch { /* Fetch 域启用失败不影响主流程 */ }
-}
-
-// --- 等待页面加载 ---
-async function waitForLoad(sessionId, timeoutMs = 15000) {
-  // 启用 Page 域
-  await sendCDP('Page.enable', {}, sessionId);
-
-  return new Promise((resolve) => {
-    let resolved = false;
-    const done = (result) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      clearInterval(checkInterval);
-      resolve(result);
-    };
-
-    const timer = setTimeout(() => done('timeout'), timeoutMs);
-    const checkInterval = setInterval(async () => {
-      try {
-        const resp = await sendCDP('Runtime.evaluate', {
-          expression: 'document.readyState',
-          returnByValue: true,
-        }, sessionId);
-        if (resp.result?.result?.value === 'complete') {
-          done('complete');
-        }
-      } catch { /* 忽略 */ }
-    }, 500);
-  });
-}
-
 // --- 读取 POST body ---
 async function readBody(req) {
   let body = '';
@@ -334,97 +57,59 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
   try {
-    // /health 不需要连接 Chrome
+    // /health 不需要 Extension 连接
     if (pathname === '/health') {
-      const extMode = useExtension();
-      const legacyConnected = ws && (ws.readyState === WS.OPEN || ws.readyState === 1);
-      res.end(JSON.stringify({
-        status: 'ok',
-        mode: extMode ? 'extension' : 'legacy',
-        connected: extMode || legacyConnected,
-        sessions: sessions.size,
-        chromePort,
-      }));
+      const connected = useExtension();
+      res.end(JSON.stringify({ status: 'ok', mode: 'extension', connected }));
       return;
     }
 
-    if (!useExtension()) { await connect(); }
+    // Extension 连接检查
+    if (!useExtension()) {
+      res.statusCode = 503;
+      res.end(JSON.stringify({ error: 'CDP Bridge Extension 未连接。请确保已安装并启用扩展。' }));
+      return;
+    }
 
     // GET /targets - 列出所有页面
     if (pathname === '/targets') {
-      if (useExtension()) {
-        const resp = await sendViaExtension('targets');
-        res.end(JSON.stringify(resp.result, null, 2));
-      } else {
-        const resp = await sendCDP('Target.getTargets');
-        const pages = resp.result.targetInfos.filter(t => t.type === 'page');
-        res.end(JSON.stringify(pages, null, 2));
-      }
+      const resp = await sendViaExtension('targets');
+      res.end(JSON.stringify(resp.result, null, 2));
     }
 
     // GET /new?url=xxx - 创建新后台 tab
     else if (pathname === '/new') {
       const targetUrl = q.url || 'about:blank';
-      if (useExtension()) {
-        const resp = await sendViaExtension('new', { url: targetUrl });
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const resp = await sendCDP('Target.createTarget', { url: targetUrl, background: true });
-        const targetId = resp.result.targetId;
-        if (targetUrl !== 'about:blank') {
-          try {
-            const sid = await ensureSession(targetId);
-            await waitForLoad(sid);
-          } catch { /* 非致命，继续 */ }
-        }
-        res.end(JSON.stringify({ targetId }));
-      }
+      const resp = await sendViaExtension('new', { url: targetUrl });
+      res.end(JSON.stringify(resp.result));
     }
 
     // GET /close?target=xxx - 关闭 tab
     else if (pathname === '/close') {
-      if (useExtension()) {
-        const resp = await sendViaExtension('close', { targetId: q.target });
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const resp = await sendCDP('Target.closeTarget', { targetId: q.target });
-        sessions.delete(q.target);
-        res.end(JSON.stringify(resp.result));
-      }
+      const resp = await sendViaExtension('close', { targetId: q.target });
+      res.end(JSON.stringify(resp.result));
     }
 
     // GET /navigate?target=xxx&url=yyy - 导航（自动等待加载）
     else if (pathname === '/navigate') {
-      if (useExtension()) {
-        const resp = await sendViaExtension('navigate', { targetId: q.target, url: q.url });
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const sid = await ensureSession(q.target);
-        const resp = await sendCDP('Page.navigate', { url: q.url }, sid);
-        await waitForLoad(sid);
-        res.end(JSON.stringify(resp.result));
-      }
+      const resp = await sendViaExtension('navigate', { targetId: q.target, url: q.url });
+      res.end(JSON.stringify(resp.result));
     }
 
     // GET /back?target=xxx - 后退
     else if (pathname === '/back') {
-      if (useExtension()) {
-        const resp = await sendViaExtension('back', { targetId: q.target });
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const sid = await ensureSession(q.target);
-        await sendCDP('Runtime.evaluate', { expression: 'history.back()' }, sid);
-        await waitForLoad(sid);
-        res.end(JSON.stringify({ ok: true }));
-      }
+      const resp = await sendViaExtension('back', { targetId: q.target });
+      res.end(JSON.stringify(resp.result));
     }
 
     // POST /eval?target=xxx - 执行 JS
     else if (pathname === '/eval') {
       const body = await readBody(req);
       const expr = body || q.expr || 'document.title';
-      const resp = await execCDP(q.target, 'Runtime.evaluate', {
-        expression: expr, returnByValue: true, awaitPromise: true,
+      const resp = await sendViaExtension('cdp', {
+        targetId: q.target,
+        method: 'Runtime.evaluate',
+        params: { expression: expr, returnByValue: true, awaitPromise: true },
       });
       if (resp.result?.result?.value !== undefined) {
         res.end(JSON.stringify({ value: resp.result.result.value }));
@@ -436,7 +121,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // POST /click?target=xxx -- JS 层面点击（简单快速，覆盖大多数场景）
+    // POST /click?target=xxx -- JS el.click()
     else if (pathname === '/click') {
       const selector = await readBody(req);
       if (!selector) {
@@ -452,8 +137,10 @@ const server = http.createServer(async (req, res) => {
         el.click();
         return { clicked: true, tag: el.tagName, text: (el.textContent || '').slice(0, 100) };
       })()`;
-      const resp = await execCDP(q.target, 'Runtime.evaluate', {
-        expression: js, returnByValue: true, awaitPromise: true,
+      const resp = await sendViaExtension('cdp', {
+        targetId: q.target,
+        method: 'Runtime.evaluate',
+        params: { expression: js, returnByValue: true, awaitPromise: true },
       });
       if (resp.result?.result?.value) {
         const val = resp.result.result.value;
@@ -464,7 +151,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // POST /clickAt?target=xxx -- CDP 浏览器级真实鼠标点击
+    // POST /clickAt?target=xxx -- CDP 真实鼠标点击
     else if (pathname === '/clickAt') {
       const selector = await readBody(req);
       if (!selector) {
@@ -472,37 +159,9 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'POST body 需要 CSS 选择器' }));
         return;
       }
-      if (useExtension()) {
-        const resp = await sendViaExtension('clickAt', { targetId: q.target, selector });
-        if (resp.result?.error) res.statusCode = 400;
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const sid = await ensureSession(q.target);
-        const selectorJson = JSON.stringify(selector);
-        const js = `(() => {
-          const el = document.querySelector(${selectorJson});
-          if (!el) return { error: '未找到元素: ' + ${selectorJson} };
-          el.scrollIntoView({ block: 'center' });
-          const rect = el.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, tag: el.tagName, text: (el.textContent || '').slice(0, 100) };
-        })()`;
-        const coordResp = await sendCDP('Runtime.evaluate', {
-          expression: js, returnByValue: true, awaitPromise: true,
-        }, sid);
-        const coord = coordResp.result?.result?.value;
-        if (!coord || coord.error) {
-          res.statusCode = 400;
-          res.end(JSON.stringify(coord || coordResp.result));
-          return;
-        }
-        await sendCDP('Input.dispatchMouseEvent', {
-          type: 'mousePressed', x: coord.x, y: coord.y, button: 'left', clickCount: 1
-        }, sid);
-        await sendCDP('Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x: coord.x, y: coord.y, button: 'left', clickCount: 1
-        }, sid);
-        res.end(JSON.stringify({ clicked: true, x: coord.x, y: coord.y, tag: coord.tag, text: coord.text }));
-      }
+      const resp = await sendViaExtension('clickAt', { targetId: q.target, selector });
+      if (resp.result?.error) res.statusCode = 400;
+      res.end(JSON.stringify(resp.result));
     }
 
     // POST /setFiles?target=xxx -- 给 file input 设置本地文件
@@ -513,28 +172,10 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: '需要 selector 和 files 字段' }));
         return;
       }
-      if (useExtension()) {
-        const resp = await sendViaExtension('setFiles', {
-          targetId: q.target, selector: body.selector, files: body.files,
-        });
-        res.end(JSON.stringify(resp.result));
-      } else {
-        const sid = await ensureSession(q.target);
-        await sendCDP('DOM.enable', {}, sid);
-        const doc = await sendCDP('DOM.getDocument', {}, sid);
-        const node = await sendCDP('DOM.querySelector', {
-          nodeId: doc.result.root.nodeId, selector: body.selector,
-        }, sid);
-        if (!node.result?.nodeId) {
-          res.statusCode = 400;
-          res.end(JSON.stringify({ error: '未找到元素: ' + body.selector }));
-          return;
-        }
-        await sendCDP('DOM.setFileInputFiles', {
-          nodeId: node.result.nodeId, files: body.files,
-        }, sid);
-        res.end(JSON.stringify({ success: true, files: body.files.length }));
-      }
+      const resp = await sendViaExtension('setFiles', {
+        targetId: q.target, selector: body.selector, files: body.files,
+      });
+      res.end(JSON.stringify(resp.result));
     }
 
     // GET /scroll?target=xxx&y=3000 - 滚动
@@ -551,8 +192,10 @@ const server = http.createServer(async (req, res) => {
       } else {
         js = `window.scrollBy(0, ${Math.abs(y)}); "scrolled down ${Math.abs(y)}px"`;
       }
-      const resp = await execCDP(q.target, 'Runtime.evaluate', {
-        expression: js, returnByValue: true,
+      const resp = await sendViaExtension('cdp', {
+        targetId: q.target,
+        method: 'Runtime.evaluate',
+        params: { expression: js, returnByValue: true },
       });
       await new Promise(r => setTimeout(r, 800));
       res.end(JSON.stringify({ value: resp.result?.result?.value }));
@@ -561,8 +204,10 @@ const server = http.createServer(async (req, res) => {
     // GET /screenshot?target=xxx&file=/tmp/x.png - 截图
     else if (pathname === '/screenshot') {
       const format = q.format || 'png';
-      const resp = await execCDP(q.target, 'Page.captureScreenshot', {
-        format, quality: format === 'jpeg' ? 80 : undefined,
+      const resp = await sendViaExtension('cdp', {
+        targetId: q.target,
+        method: 'Page.captureScreenshot',
+        params: { format, quality: format === 'jpeg' ? 80 : undefined },
       });
       if (q.file) {
         fs.writeFileSync(q.file, Buffer.from(resp.result.data, 'base64'));
@@ -575,9 +220,13 @@ const server = http.createServer(async (req, res) => {
 
     // GET /info?target=xxx - 获取页面信息
     else if (pathname === '/info') {
-      const resp = await execCDP(q.target, 'Runtime.evaluate', {
-        expression: 'JSON.stringify({title: document.title, url: location.href, ready: document.readyState})',
-        returnByValue: true,
+      const resp = await sendViaExtension('cdp', {
+        targetId: q.target,
+        method: 'Runtime.evaluate',
+        params: {
+          expression: 'JSON.stringify({title: document.title, url: location.href, ready: document.readyState})',
+          returnByValue: true,
+        },
       });
       res.end(resp.result?.result?.value || '{}');
     }
@@ -596,6 +245,8 @@ const server = http.createServer(async (req, res) => {
           '/info?target=': 'GET - 页面标题/URL/状态',
           '/eval?target=': 'POST body=JS表达式 - 执行 JS',
           '/click?target=': 'POST body=CSS选择器 - 点击元素',
+          '/clickAt?target=': 'POST body=CSS选择器 - 真实鼠标点击',
+          '/setFiles?target=': 'POST body=JSON - 设置文件',
           '/scroll?target=&y=&direction=': 'GET - 滚动页面',
           '/screenshot?target=&file=': 'GET - 截图',
         },
@@ -608,43 +259,37 @@ const server = http.createServer(async (req, res) => {
 });
 
 // --- Extension WebSocket upgrade ---
-if (extensionWss) {
-  server.on('upgrade', (req, socket, head) => {
-    const parsed = new URL(req.url, `http://localhost:${PORT}`);
-    if (parsed.pathname !== '/extension') {
-      socket.destroy();
-      return;
-    }
+server.on('upgrade', (req, socket, head) => {
+  const parsed = new URL(req.url, `http://localhost:${PORT}`);
+  if (parsed.pathname !== '/extension') {
+    socket.destroy();
+    return;
+  }
 
-    extensionWss.handleUpgrade(req, socket, head, (ws) => {
-      extensionWs = ws;
-      console.log('[CDP Proxy] Extension connected');
-      // 同步 chromePort 给 Extension，用于精确端口拦截
-      if (chromePort) {
-        ws.send(JSON.stringify({ type: 'config', chromePort }));
+  extensionWss.handleUpgrade(req, socket, head, (ws) => {
+    extensionWs = ws;
+    console.log('[CDP Proxy] Extension connected');
+    ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return; }
+      if (msg.id && extensionPending.has(msg.id)) {
+        const { resolve, reject, timer } = extensionPending.get(msg.id);
+        clearTimeout(timer);
+        extensionPending.delete(msg.id);
+        if (msg.error) { reject(new Error(msg.error)); } else { resolve({ result: msg.result }); }
       }
-      ws.on('message', (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch { return; }
-        if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return; }
-        if (msg.id && extensionPending.has(msg.id)) {
-          const { resolve, reject, timer } = extensionPending.get(msg.id);
-          clearTimeout(timer);
-          extensionPending.delete(msg.id);
-          if (msg.error) { reject(new Error(msg.error)); } else { resolve({ result: msg.result }); }
-        }
-      });
-      ws.on('close', () => {
-        console.log('[CDP Proxy] Extension disconnected');
-        if (extensionWs === ws) extensionWs = null;
-        for (const [, { reject, timer }] of extensionPending) { clearTimeout(timer); reject(new Error('Extension disconnected')); }
-        extensionPending.clear();
-      });
+    });
+    ws.on('close', () => {
+      console.log('[CDP Proxy] Extension disconnected');
+      if (extensionWs === ws) extensionWs = null;
+      for (const [, { reject, timer }] of extensionPending) { clearTimeout(timer); reject(new Error('Extension disconnected')); }
+      extensionPending.clear();
     });
   });
-}
+});
 
-// 检查端口是否被占用
+// --- 启动 ---
 function checkPortAvailable(port) {
   return new Promise((resolve) => {
     const s = net.createServer();
@@ -655,10 +300,8 @@ function checkPortAvailable(port) {
 }
 
 async function main() {
-  // 检查是否已有 proxy 在运行
   const available = await checkPortAvailable(PORT);
   if (!available) {
-    // 验证已有实例是否健康
     try {
       const ok = await new Promise((resolve) => {
         http.get(`http://127.0.0.1:${PORT}/health`, { timeout: 2000 }, (res) => {
@@ -671,21 +314,17 @@ async function main() {
         console.log(`[CDP Proxy] 已有实例运行在端口 ${PORT}，退出`);
         process.exit(0);
       }
-    } catch { /* 端口占用但非 proxy，继续报错 */ }
+    } catch {}
     console.error(`[CDP Proxy] 端口 ${PORT} 已被占用`);
     process.exit(1);
   }
 
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`[CDP Proxy] 运行在 http://127.0.0.1:${PORT}`);
-    if (extensionWss) {
-      console.log(`[CDP Proxy] 等待 Extension 连接到 ws://localhost:${PORT}/extension`);
-    }
-    connect().catch(e => console.log('[CDP Proxy] Legacy CDP 未就绪:', e.message, '（等待 Extension 或首次请求时重试）'));
+    console.log(`[CDP Proxy] 运行在 http://127.0.0.1:${PORT} (extension-only)`);
+    console.log(`[CDP Proxy] 等待 Extension 连接到 ws://localhost:${PORT}/extension`);
   });
 }
 
-// 防止未捕获异常导致进程崩溃
 process.on('uncaughtException', (e) => {
   console.error('[CDP Proxy] 未捕获异常:', e.message);
 });
